@@ -20,6 +20,10 @@ requests_per_minute = 60
 # Verify SSL certificates for API connections
 # Set to false if you encounter SSL certificate verification errors (not recommended)
 verify_ssl = true
+# Global bandwidth limit in MB/s across all concurrent downloads
+# Set to -1 for no limit. When multiple downloads are active, bandwidth is shared equally
+# For example: 9 MB/s limit with 3 active downloads = 3 MB/s per download
+bandwidth_limit = -1
 
 [qobuz]
 # 1: 320kbps MP3, 2: 16/44.1, 3: 24/<=96, 4: 24/>=96

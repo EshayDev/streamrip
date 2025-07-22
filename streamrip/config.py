@@ -201,6 +201,10 @@ class DownloadsConfig:
     # Verify SSL certificates for API connections
     # Set to false if you encounter SSL certificate verification errors (not recommended)
     verify_ssl: bool
+    # Global bandwidth limit in MB/s across all concurrent downloads
+    # Set to -1 for no limit. When multiple downloads are active, bandwidth is shared equally
+    # For example: 9 MB/s limit with 3 active downloads = 3 MB/s per download
+    bandwidth_limit: float
 
 
 @dataclass(slots=True)

@@ -40,8 +40,35 @@ class Album(Media):
             except Exception as e:
                 logger.error(f"Error downloading track: {e}")
 
+        # Resolve all tracks first
+        resolved_tracks = []
+        resolve_results = await asyncio.gather(
+            *[p.resolve() for p in self.tracks], return_exceptions=True
+        )
+        
+        for result in resolve_results:
+            if isinstance(result, Exception):
+                logger.error(f"Album track resolution error: {result}")
+            elif result is not None:
+                resolved_tracks.append(result)
+        
+        if not resolved_tracks:
+            return
+
+        # Pre-fetch file sizes for all tracks concurrently to avoid blocking during downloads
+        async def _prefetch_size(track):
+            try:
+                await track.downloadable.size()
+            except Exception as e:
+                logger.debug(f"Error pre-fetching size for track {track.meta.title}: {e}")
+        
+        await asyncio.gather(
+            *[_prefetch_size(track) for track in resolved_tracks], return_exceptions=True
+        )
+
+        # Now download all tracks
         results = await asyncio.gather(
-            *[_resolve_and_download(p) for p in self.tracks], return_exceptions=True
+            *[track.rip() for track in resolved_tracks], return_exceptions=True
         )
 
         for result in results:

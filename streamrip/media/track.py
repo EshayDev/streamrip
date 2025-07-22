@@ -39,31 +39,38 @@ class Track(Media):
 
     async def download(self):
         # TODO: progress bar description
+        # File size should already be cached from pre-fetch in album.download()
+        try:
+            file_size = await self.downloadable.size()
+        except Exception as e:
+            logger.error(f"Error getting file size for track '{self.meta.title}': {e}")
+            file_size = 0
+        
+        # Get bandwidth limit from config
+        bandwidth_limit = self.config.session.downloads.bandwidth_limit
+        
         async with global_download_semaphore(self.config.session.downloads):
             with get_progress_callback(
                 self.config.session.cli.progress_bars,
-                await self.downloadable.size(),
+                file_size,
                 f"Track {self.meta.tracknumber}",
             ) as callback:
                 try:
-                    await self.downloadable.download(self.download_path, callback)
-                    retry = False
+                    await self.downloadable.download(self.download_path, callback, bandwidth_limit)
+                    return  # Success, no retry needed
                 except Exception as e:
                     logger.error(
                         f"Error downloading track '{self.meta.title}', retrying: {e}"
                     )
-                    retry = True
 
-            if not retry:
-                return
-
+            # Retry logic - file size should still be cached
             with get_progress_callback(
                 self.config.session.cli.progress_bars,
-                await self.downloadable.size(),
+                file_size,  # Use cached size for retry
                 f"Track {self.meta.tracknumber} (retry)",
             ) as callback:
                 try:
-                    await self.downloadable.download(self.download_path, callback)
+                    await self.downloadable.download(self.download_path, callback, bandwidth_limit)
                 except Exception as e:
                     logger.error(
                         f"Persistent error downloading track '{self.meta.title}', skipping: {e}"

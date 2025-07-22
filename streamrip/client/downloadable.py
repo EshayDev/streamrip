@@ -22,6 +22,7 @@ from Cryptodome.Cipher import AES, Blowfish
 from Cryptodome.Util import Counter
 
 from .. import converter
+from ..bandwidth_limiter import get_global_bandwidth_limiter
 from ..exceptions import NonStreamableError
 
 logger = logging.getLogger("streamrip")
@@ -37,16 +38,56 @@ def generate_temp_path(url: str):
     )
 
 
-async def fast_async_download(path, url, headers, callback):
-    """Synchronous download with yield for every 1MB read.
+async def fast_async_download(path, url, headers, callback, bandwidth_limit_mbps: float = -1):
+    """Synchronous download with yield for every 1MB read and optional bandwidth limiting.
 
     Using aiofiles/aiohttp resulted in a yield to the event loop for every 1KB,
     which made file downloads CPU-bound. This resulted in a ~10MB max total download
     speed. This fixes the issue by only yielding to the event loop for every 1MB read.
+    
+    Args:
+        path: File path to save to
+        url: URL to download from
+        headers: HTTP headers
+        callback: Progress callback function
+        bandwidth_limit_mbps: Global bandwidth limit in MB/s, -1 for no limit
     """
     chunk_size: int = 2**17  # 131 KB
     counter = 0
     yield_every = 8  # 1 MB
+    
+    # Get global bandwidth limiter
+    global_limiter = get_global_bandwidth_limiter(bandwidth_limit_mbps)
+    
+    if global_limiter is not None:
+        async with global_limiter.limit_download() as rate_limiter:
+            await _download_with_rate_limit(path, url, headers, callback, chunk_size, yield_every, rate_limiter)
+    else:
+        await _download_without_rate_limit(path, url, headers, callback, chunk_size, yield_every)
+
+
+async def _download_with_rate_limit(path, url, headers, callback, chunk_size, yield_every, rate_limiter):
+    """Download with rate limiting."""
+    counter = 0
+    with open(path, "wb") as file:  # noqa: ASYNC101
+        with requests.get(  # noqa: ASYNC100
+            url,
+            headers=headers,
+            allow_redirects=True,
+            stream=True,
+        ) as resp:
+            for chunk in resp.iter_content(chunk_size=chunk_size):
+                file.write(chunk)
+                callback(len(chunk))
+                await rate_limiter.consume(len(chunk))
+                if counter % yield_every == 0:
+                    await asyncio.sleep(0)
+                counter += 1
+
+
+async def _download_without_rate_limit(path, url, headers, callback, chunk_size, yield_every):
+    """Download without rate limiting (original behavior)."""
+    counter = 0
     with open(path, "wb") as file:  # noqa: ASYNC101
         with requests.get(  # noqa: ASYNC100
             url,
@@ -70,8 +111,8 @@ class Downloadable(ABC):
     source: str = "Unknown"
     _size_base: Optional[int] = None
 
-    async def download(self, path: str, callback: Callable[[int], Any]):
-        await self._download(path, callback)
+    async def download(self, path: str, callback: Callable[[int], Any], bandwidth_limit_mbps: float = -1):
+        await self._download(path, callback, bandwidth_limit_mbps)
 
     async def size(self) -> int:
         if hasattr(self, "_size") and self._size is not None:
@@ -92,7 +133,7 @@ class Downloadable(ABC):
         self._size_base = v
 
     @abstractmethod
-    async def _download(self, path: str, callback: Callable[[int], None]):
+    async def _download(self, path: str, callback: Callable[[int], None], bandwidth_limit_mbps: float = -1):
         raise NotImplementedError
 
 
@@ -112,8 +153,8 @@ class BasicDownloadable(Downloadable):
         self._size = None
         self.source: str = source or "Unknown"
 
-    async def _download(self, path: str, callback):
-        await fast_async_download(path, self.url, self.session.headers, callback)
+    async def _download(self, path: str, callback, bandwidth_limit_mbps: float = -1):
+        await fast_async_download(path, self.url, self.session.headers, callback, bandwidth_limit_mbps)
 
 
 class DeezerDownloadable(Downloadable):
@@ -140,7 +181,7 @@ class DeezerDownloadable(Downloadable):
             self.extension = "flac"
         self.id = str(info["id"])
 
-    async def _download(self, path: str, callback):
+    async def _download(self, path: str, callback, bandwidth_limit_mbps: float = -1):
         # with requests.Session().get(self.url, allow_redirects=True) as resp:
         async with self.session.get(self.url, allow_redirects=True) as resp:
             resp.raise_for_status()
@@ -160,7 +201,7 @@ class DeezerDownloadable(Downloadable):
             if self.is_encrypted.search(self.url) is None:
                 logger.debug(f"Deezer file at {self.url} not encrypted.")
                 await fast_async_download(
-                    path, self.url, self.session.headers, callback
+                    path, self.url, self.session.headers, callback, bandwidth_limit_mbps
                 )
             else:
                 blowfish_key = self._generate_blowfish_key(self.id)
@@ -253,8 +294,8 @@ class TidalDownloadable(Downloadable):
         self.enc_key = encryption_key
         self.downloadable = BasicDownloadable(session, url, self.extension, "tidal")
 
-    async def _download(self, path: str, callback):
-        await self.downloadable._download(path, callback)
+    async def _download(self, path: str, callback, bandwidth_limit_mbps: float = -1):
+        await self.downloadable._download(path, callback, bandwidth_limit_mbps)
         if self.enc_key is not None:
             dec_bytes = await self._decrypt_mqa_file(path, self.enc_key)
             async with aiofiles.open(path, "wb") as audio:
@@ -319,22 +360,22 @@ class SoundcloudDownloadable(Downloadable):
             raise Exception(f"Invalid file type: {self.file_type}")
         self.url = info["url"]
 
-    async def _download(self, path, callback):
+    async def _download(self, path, callback, bandwidth_limit_mbps: float = -1):
         if self.file_type == "mp3":
-            await self._download_mp3(path, callback)
+            await self._download_mp3(path, callback, bandwidth_limit_mbps)
         else:
-            await self._download_original(path, callback)
+            await self._download_original(path, callback, bandwidth_limit_mbps)
 
-    async def _download_original(self, path: str, callback):
+    async def _download_original(self, path: str, callback, bandwidth_limit_mbps: float = -1):
         downloader = BasicDownloadable(
             self.session, self.url, "flac", source="soundcloud"
         )
-        await downloader.download(path, callback)
+        await downloader.download(path, callback, bandwidth_limit_mbps)
         self.size = downloader.size
         engine = converter.FLAC(path)
         await engine.convert(path)
 
-    async def _download_mp3(self, path: str, callback):
+    async def _download_mp3(self, path: str, callback, bandwidth_limit_mbps: float = -1):
         # TODO: make progress bar reflect bytes
         async with self.session.get(self.url) as resp:
             content = await resp.text("utf-8")
